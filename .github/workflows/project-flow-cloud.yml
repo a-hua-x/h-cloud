@@ -125,6 +125,7 @@ jobs:
         with:
           name: project-flow-${{ inputs.request_id }}
           path: ${{ runner.temp }}/project-flow-site
+          include-hidden-files: true
           retention-days: 3
           if-no-files-found: error
       - name: Prepare Pages artifact
@@ -133,6 +134,9 @@ jobs:
         with:
           path: ${{ runner.temp }}/project-flow-site
   publish:
+    concurrency:
+      group: project-flow-pages
+      cancel-in-progress: false
     if: inputs.mode == 'publish'
     needs: build
     runs-on: ubuntu-latest
