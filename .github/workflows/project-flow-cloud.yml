@@ -1,0 +1,123 @@
+name: Project Flow Cloud
+run-name: ProjectFlow:${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      mode:
+        required: true
+        type: choice
+        options: [build, publish]
+        default: build
+      directory:
+        type: string
+        default: '.'
+      manager:
+        type: choice
+        options: [npm, pnpm, yarn, static]
+        default: npm
+      node:
+        type: choice
+        options: ['20', '22', '24']
+        default: '22'
+      script:
+        type: string
+        default: build
+      output:
+        type: string
+        default: dist
+permissions:
+  contents: read
+concurrency:
+  group: project-flow-${{ inputs.request_id }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node }}
+      - name: Validate and build
+        env:
+          PF_REQUEST: ${{ inputs.request_id }}
+          PF_SOURCE_SHA: ${{ inputs.source_sha }}
+          PF_DIRECTORY: ${{ inputs.directory }}
+          PF_MANAGER: ${{ inputs.manager }}
+          PF_SCRIPT: ${{ inputs.script }}
+          PF_OUTPUT: ${{ inputs.output }}
+        run: |
+          python3 - <<'PY'
+          import os,re,json,subprocess,shutil,hashlib
+          from pathlib import Path
+          root=Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          def scoped(value):
+            if not value or '\\' in value or ':' in value or value.startswith('/') or any(p in ('..','.git','') for p in value.split('/')):raise SystemExit('Invalid relative directory')
+            p=(root/value).resolve()
+            if p!=root and root not in p.parents:raise SystemExit('Directory escaped repository')
+            return p
+          request=os.environ['PF_REQUEST'];sha=os.environ['PF_SOURCE_SHA']
+          if not re.fullmatch(r'[a-zA-Z0-9_-]{1,100}',request) or not re.fullmatch(r'[a-f0-9]{40}',sha):raise SystemExit('Invalid run identity')
+          directory=scoped(os.environ['PF_DIRECTORY']);manager=os.environ['PF_MANAGER'];script=os.environ['PF_SCRIPT']
+          if manager!='static':
+            if manager not in ['npm','pnpm','yarn'] or not re.fullmatch(r'[a-zA-Z0-9:_-]{1,100}',script):raise SystemExit('Invalid build configuration')
+            package=json.loads((directory/'package.json').read_text())
+            if script not in package.get('scripts',{}):raise SystemExit('Script missing from package.json')
+            lock={'npm':'package-lock.json','pnpm':'pnpm-lock.yaml','yarn':'yarn.lock'}[manager]
+            if not (directory/lock).is_file():raise SystemExit('Commit the package manager lockfile first')
+            prefix=['npm'] if manager=='npm' else ['corepack',manager]
+            subprocess.run(prefix+(['ci'] if manager=='npm' else ['install','--frozen-lockfile']),cwd=directory,check=True)
+            subprocess.run(prefix+['run',script],cwd=directory,check=True)
+          output=(directory/os.environ['PF_OUTPUT']).resolve()
+          scoped(str(output.relative_to(root)))
+          if output==root or not output.is_dir():raise SystemExit('Use a separate existing artifact directory')
+          destination=Path(os.environ['RUNNER_TEMP'])/'project-flow-site';destination.mkdir()
+          total=0;files=[]
+          for source in output.rglob('*'):
+            if source.is_symlink() or '.git' in source.relative_to(output).parts:raise SystemExit('Unsafe output entry')
+            if source.is_file():
+              total+=source.stat().st_size
+              if total>200*1024*1024 or len(files)>=20000:raise SystemExit('Artifact too large')
+              target=destination/source.relative_to(output);target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(source,target)
+              files.append({'path':source.relative_to(output).as_posix(),'sha256':hashlib.sha256(source.read_bytes()).hexdigest()})
+          if not files:raise SystemExit('No build artifacts produced')
+          manifest={'requestId':request,'sourceSha':sha,'files':files,'bytes':total}
+          (destination/'project-flow-build.json').write_text(json.dumps(manifest))
+          PY
+      - name: Save build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-flow-${{ inputs.request_id }}
+          path: ${{ runner.temp }}/project-flow-site
+          retention-days: 3
+          if-no-files-found: error
+      - name: Prepare Pages artifact
+        if: inputs.mode == 'publish'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/project-flow-site
+  publish:
+    if: inputs.mode == 'publish'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy preview
+        id: deployment
+        uses: actions/deploy-pages@v4
